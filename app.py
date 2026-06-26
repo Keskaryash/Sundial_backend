@@ -26,8 +26,8 @@ app = Flask(__name__)
 def add_cors_headers(response):
     """Allow requests from the PWA frontend (a different origin)."""
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Key"
     return response
 
 
@@ -39,6 +39,21 @@ def cors_preflight(_any):
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 VALID_TIMEZONES = available_timezones()
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+
+
+def require_admin():
+    """
+    Returns None if the request has a valid admin key, otherwise returns
+    a Flask response describing the auth failure. Caller should `return`
+    that response immediately if it isn't None.
+    """
+    if not ADMIN_KEY:
+        return jsonify({"error": "Admin access is not configured on this server."}), 503
+    provided = request.headers.get("X-Admin-Key", "")
+    if provided != ADMIN_KEY:
+        return jsonify({"error": "Unauthorized."}), 401
+    return None
 
 
 def get_db():
@@ -235,6 +250,30 @@ def update_profile(profile_id):
     return jsonify(serialize_profile(row))
 
 
+@app.route("/api/profile/<profile_id>", methods=["DELETE"])
+def delete_profile(profile_id):
+    """
+    Permanently delete a profile. Used by the 'delete & reset' option in the
+    app, so a person can fully remove their data rather than just clearing
+    local storage and leaving an orphaned profile in the database.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM profiles WHERE id = %s", (profile_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "profile not found"}), 404
+
+    cur.execute("DELETE FROM profiles WHERE id = %s", (profile_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({"id": profile_id, "deleted": True})
+
+
 @app.route("/api/profiles/batch", methods=["POST"])
 def get_profiles_batch():
     """
@@ -261,6 +300,53 @@ def get_profiles_batch():
     results = [found.get(pid) for pid in ids]  # preserve order, None if not found
 
     return jsonify({"profiles": results})
+
+
+@app.route("/api/admin/profiles", methods=["GET"])
+def admin_list_profiles():
+    """
+    Admin-only: list every profile in the database. Requires the
+    X-Admin-Key header to match the ADMIN_KEY environment variable.
+    """
+    auth_error = require_admin()
+    if auth_error:
+        return auth_error
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM profiles ORDER BY updated_at DESC")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify({"profiles": [serialize_profile(row) for row in rows], "count": len(rows)})
+
+
+@app.route("/api/admin/profile/<profile_id>", methods=["DELETE"])
+def admin_delete_profile(profile_id):
+    """
+    Admin-only: delete any profile by ID, regardless of who owns it.
+    Requires the X-Admin-Key header to match the ADMIN_KEY environment variable.
+    """
+    auth_error = require_admin()
+    if auth_error:
+        return auth_error
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM profiles WHERE id = %s", (profile_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "profile not found"}), 404
+
+    cur.execute("DELETE FROM profiles WHERE id = %s", (profile_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({"id": profile_id, "deleted": True})
 
 
 @app.route("/api/timezones", methods=["GET"])
