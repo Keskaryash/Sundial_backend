@@ -756,6 +756,40 @@ def generate_recovery_code_for_existing_profile(profile_id):
     return jsonify({"id": profile_id, "recovery_code": new_code})
 
 
+@app.route("/api/profile/<profile_id>/regenerate-recovery-code", methods=["POST"])
+def regenerate_recovery_code_self_service(profile_id):
+    """
+    Self-service version of regenerating a recovery code, for the common
+    "I never actually wrote my code down" situation. Unlike the admin
+    regenerate route, this requires no special auth beyond knowing your own
+    profile ID — the same trust level as everything else self-service in
+    this app. This is safe specifically because it's the profile's own
+    owner replacing their own code (not a third party silently locking
+    someone else out), which is the scenario the original generate-only-once
+    restriction was guarding against.
+    Always succeeds if the profile exists, replacing any existing code.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM profiles WHERE id = %s", (profile_id,))
+    if not cur.fetchone():
+        cur.close()
+        conn.close()
+        return jsonify({"error": "profile not found"}), 404
+
+    new_code = generate_recovery_code()
+    new_hash = hash_recovery_code(new_code)
+    cur.execute(
+        "UPDATE profiles SET recovery_code_hash = %s WHERE id = %s",
+        (new_hash, profile_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({"id": profile_id, "recovery_code": new_code})
+
+
 @app.route("/api/timezones", methods=["GET"])
 def list_timezones():
     """Returns all valid IANA timezone names, sorted."""
