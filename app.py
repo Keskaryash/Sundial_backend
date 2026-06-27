@@ -227,7 +227,10 @@ def get_profile(profile_id):
 
     cur.close()
     conn.close()
-    return jsonify(serialize_profile(row))
+    result = serialize_profile(row)
+    if viewer_id == profile_id:
+        result["has_recovery_code"] = bool(row["recovery_code_hash"])  # only visible to the profile's own owner
+    return jsonify(result)
 
 
 @app.route("/api/profile/<profile_id>", methods=["PATCH"])
@@ -538,6 +541,62 @@ def create_friend_request():
     return jsonify(serialize_request(row)), 201
 
 
+@app.route("/api/friend-request/backfill-legacy", methods=["POST"])
+def backfill_legacy_friendship():
+    """
+    One-time self-healing endpoint for friendships that existed before the
+    approval system was introduced. Since those relationships have no
+    friend_requests row at all (neither pending nor approved), the normal
+    approval logic would incorrectly hide them. This creates an ALREADY
+    APPROVED request in both directions between two existing profiles, so
+    a pre-existing friendship keeps working without requiring either side
+    to manually re-approve the other.
+
+    This is intentionally NOT how new friendships are created (those still
+    go through the normal pending -> approve flow) — it only ever upgrades
+    a relationship with zero existing request rows, and is a no-op if any
+    request already exists in either direction.
+    Body: {"profile_id_a": "...", "profile_id_b": "..."}
+    """
+    data = request.get_json(force=True) or {}
+    a = (data.get("profile_id_a") or "").strip()
+    b = (data.get("profile_id_b") or "").strip()
+
+    if not a or not b or a == b:
+        return jsonify({"error": "two distinct profile IDs are required"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM profiles WHERE id IN (%s, %s)", (a, b))
+    if len(cur.fetchall()) != 2:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "one or both profiles not found"}), 404
+
+    now = datetime.now(dt_timezone.utc).isoformat()
+    created = []
+    for requester, target in [(a, b), (b, a)]:
+        cur.execute(
+            "SELECT * FROM friend_requests WHERE requester_id = %s AND target_id = %s",
+            (requester, target),
+        )
+        if cur.fetchone():
+            continue  # a request already exists this direction — leave it untouched
+        cur.execute(
+            "INSERT INTO friend_requests (requester_id, target_id, status, created_at, responded_at) "
+            "VALUES (%s, %s, 'approved', %s, %s) RETURNING *",
+            (requester, target, now, now),
+        )
+        created.append(serialize_request(cur.fetchone()))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({"created": created})
+
+
 @app.route("/api/friend-requests/incoming/<target_id>", methods=["GET"])
 def list_incoming_requests(target_id):
     """Lists pending requests where someone wants to add target_id."""
@@ -656,6 +715,45 @@ def recover_profile(profile_id):
         return generic_error
 
     return jsonify(serialize_profile(row))
+
+
+@app.route("/api/profile/<profile_id>/generate-recovery-code", methods=["POST"])
+def generate_recovery_code_for_existing_profile(profile_id):
+    """
+    Generates a recovery code for a profile that doesn't have one yet —
+    covers profiles created before this feature existed. If a code already
+    exists, this refuses rather than silently replacing it, so a person
+    can't be locked out by someone else re-generating their code without
+    them noticing (the dedicated regenerate flow for "I lost my code" is
+    intentionally only available via the admin, not this self-serve route).
+    Returns the new plaintext code once, same as profile creation does.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM profiles WHERE id = %s", (profile_id,))
+    row = cur.fetchone()
+
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "profile not found"}), 404
+
+    if row["recovery_code_hash"]:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "This profile already has a recovery code set."}), 409
+
+    new_code = generate_recovery_code()
+    new_hash = hash_recovery_code(new_code)
+    cur.execute(
+        "UPDATE profiles SET recovery_code_hash = %s WHERE id = %s",
+        (new_hash, profile_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({"id": profile_id, "recovery_code": new_code})
 
 
 @app.route("/api/timezones", methods=["GET"])
