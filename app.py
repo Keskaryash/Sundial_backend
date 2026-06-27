@@ -578,6 +578,69 @@ def create_friend_request():
     return jsonify(serialize_request(row)), 201
 
 
+@app.route("/api/friend-request/add-back", methods=["POST"])
+def add_back_friend():
+    """
+    Creates an immediately-approved request from requester_id to target_id,
+    skipping the normal pending step — but ONLY if target_id already has an
+    approved request to requester_id (i.e. "add them back" after approving
+    someone who added you first). This is what powers the "add them back?"
+    prompt shown right after approving an incoming request.
+
+    Without this guard, anyone could claim "they added me first" to bypass
+    approval entirely — the guard makes that impossible, since the reverse
+    relationship has to already be real and approved.
+    Body: {"requester_id": "...", "target_id": "...", "nickname": "..."}
+    """
+    data = request.get_json(force=True) or {}
+    requester_id = (data.get("requester_id") or "").strip()
+    target_id = (data.get("target_id") or "").strip()
+    nickname = (data.get("nickname") or "").strip()[:80]
+
+    if not requester_id or not target_id:
+        return jsonify({"error": "requester_id and target_id are required"}), 400
+    if requester_id == target_id:
+        return jsonify({"error": "cannot add yourself"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # The reverse direction must already be a real, approved request —
+    # this is the safety check that makes auto-approval legitimate here.
+    cur.execute(
+        "SELECT status FROM friend_requests WHERE requester_id = %s AND target_id = %s",
+        (target_id, requester_id),
+    )
+    reverse = cur.fetchone()
+    if not reverse or reverse["status"] != "approved":
+        cur.close()
+        conn.close()
+        return jsonify({"error": "can only add back someone who has an approved request to you"}), 403
+
+    cur.execute(
+        "SELECT * FROM friend_requests WHERE requester_id = %s AND target_id = %s",
+        (requester_id, target_id),
+    )
+    existing = cur.fetchone()
+    if existing:
+        cur.close()
+        conn.close()
+        return jsonify(serialize_request(existing)), 200
+
+    now = datetime.now(dt_timezone.utc).isoformat()
+    cur.execute(
+        "INSERT INTO friend_requests (requester_id, target_id, status, created_at, responded_at, nickname) "
+        "VALUES (%s, %s, 'approved', %s, %s, %s) RETURNING *",
+        (requester_id, target_id, now, now, nickname),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify(serialize_request(row)), 201
+
+
 @app.route("/api/friend-request/backfill-legacy", methods=["POST"])
 def backfill_legacy_friendship():
     """
