@@ -119,6 +119,10 @@ def init_db():
             UNIQUE(requester_id, target_id)
         )
     """)
+    # nickname is the requester's personal label for the target (e.g. "Mom"
+    # instead of their real name) — inherently personal, so it lives on the
+    # request row (one per requester->target pair) rather than the profile.
+    cur.execute("ALTER TABLE friend_requests ADD COLUMN IF NOT EXISTS nickname TEXT DEFAULT ''")
     conn.commit()
     cur.close()
     conn.close()
@@ -416,6 +420,37 @@ def admin_list_profiles():
     return jsonify({"profiles": profiles, "count": len(rows)})
 
 
+@app.route("/api/admin/friend-requests", methods=["GET"])
+def admin_list_all_friend_requests():
+    """
+    Admin-only: returns every friend_requests row across all users, with
+    both the requester's and target's names resolved, so the admin page can
+    show "who has added whom" without needing per-profile follow-up calls.
+    """
+    auth_error = require_admin()
+    if auth_error:
+        return auth_error
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM profiles")
+    name_lookup = {r["id"]: r["name"] for r in cur.fetchall()}
+
+    cur.execute("SELECT * FROM friend_requests ORDER BY created_at DESC")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    results = []
+    for row in rows:
+        r = serialize_request(row)
+        r["requester_name"] = name_lookup.get(row["requester_id"], "(deleted profile)")
+        r["target_name"] = name_lookup.get(row["target_id"], "(deleted profile)")
+        results.append(r)
+
+    return jsonify({"requests": results, "count": len(results)})
+
+
 @app.route("/api/admin/profile/<profile_id>", methods=["DELETE"])
 def admin_delete_profile(profile_id):
     """
@@ -485,6 +520,7 @@ def serialize_request(row, name_lookup=None):
         "status": row["status"],
         "created_at": row["created_at"],
         "responded_at": row["responded_at"],
+        "nickname": row["nickname"] or "",
     }
     if name_lookup and row["requester_id"] in name_lookup:
         result["requester_name"] = name_lookup[row["requester_id"]]
@@ -497,11 +533,12 @@ def create_friend_request():
     Create (or re-fetch the status of) a friend request from requester_id
     to target_id. If one already exists, returns its current status rather
     than erroring — so retrying an add is harmless and idempotent.
-    Body: {"requester_id": "...", "target_id": "..."}
+    Body: {"requester_id": "...", "target_id": "...", "nickname": "..."}
     """
     data = request.get_json(force=True) or {}
     requester_id = (data.get("requester_id") or "").strip()
     target_id = (data.get("target_id") or "").strip()
+    nickname = (data.get("nickname") or "").strip()[:80]
 
     if not requester_id or not target_id:
         return jsonify({"error": "requester_id and target_id are required"}), 400
@@ -529,9 +566,9 @@ def create_friend_request():
 
     now = datetime.now(dt_timezone.utc).isoformat()
     cur.execute(
-        "INSERT INTO friend_requests (requester_id, target_id, status, created_at) "
-        "VALUES (%s, %s, 'pending', %s) RETURNING *",
-        (requester_id, target_id, now),
+        "INSERT INTO friend_requests (requester_id, target_id, status, created_at, nickname) "
+        "VALUES (%s, %s, 'pending', %s, %s) RETURNING *",
+        (requester_id, target_id, now, nickname),
     )
     row = cur.fetchone()
     conn.commit()
@@ -556,11 +593,15 @@ def backfill_legacy_friendship():
     go through the normal pending -> approve flow) — it only ever upgrades
     a relationship with zero existing request rows, and is a no-op if any
     request already exists in either direction.
-    Body: {"profile_id_a": "...", "profile_id_b": "..."}
+    Body: {"profile_id_a": "...", "profile_id_b": "...",
+           "nickname_a_for_b": "...", "nickname_b_for_a": "..."}
+    (both nickname fields optional)
     """
     data = request.get_json(force=True) or {}
     a = (data.get("profile_id_a") or "").strip()
     b = (data.get("profile_id_b") or "").strip()
+    nickname_a_for_b = (data.get("nickname_a_for_b") or "").strip()[:80]
+    nickname_b_for_a = (data.get("nickname_b_for_a") or "").strip()[:80]
 
     if not a or not b or a == b:
         return jsonify({"error": "two distinct profile IDs are required"}), 400
@@ -576,6 +617,7 @@ def backfill_legacy_friendship():
 
     now = datetime.now(dt_timezone.utc).isoformat()
     created = []
+    nickname_by_requester = {a: nickname_a_for_b, b: nickname_b_for_a}
     for requester, target in [(a, b), (b, a)]:
         cur.execute(
             "SELECT * FROM friend_requests WHERE requester_id = %s AND target_id = %s",
@@ -584,9 +626,9 @@ def backfill_legacy_friendship():
         if cur.fetchone():
             continue  # a request already exists this direction — leave it untouched
         cur.execute(
-            "INSERT INTO friend_requests (requester_id, target_id, status, created_at, responded_at) "
-            "VALUES (%s, %s, 'approved', %s, %s) RETURNING *",
-            (requester, target, now, now),
+            "INSERT INTO friend_requests (requester_id, target_id, status, created_at, responded_at, nickname) "
+            "VALUES (%s, %s, 'approved', %s, %s, %s) RETURNING *",
+            (requester, target, now, now, nickname_by_requester[requester]),
         )
         created.append(serialize_request(cur.fetchone()))
 
@@ -636,6 +678,79 @@ def list_outgoing_requests(requester_id):
     cur.close()
     conn.close()
     return jsonify({"requests": [serialize_request(r) for r in rows]})
+
+
+@app.route("/api/friend-request/<int:request_id>/nickname", methods=["PATCH"])
+def update_friend_nickname(request_id):
+    """
+    Updates the nickname on a friend request — only the requester (the
+    person who has this nickname for their own friend) can change it.
+    Body: {"requester_id": "...", "nickname": "..."}
+    """
+    data = request.get_json(force=True) or {}
+    requester_id = (data.get("requester_id") or "").strip()
+    nickname = (data.get("nickname") or "").strip()[:80]
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM friend_requests WHERE id = %s", (request_id,))
+    row = cur.fetchone()
+
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "request not found"}), 404
+    if row["requester_id"] != requester_id:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "only the requester can rename their own nickname for this friend"}), 403
+
+    cur.execute(
+        "UPDATE friend_requests SET nickname = %s WHERE id = %s RETURNING *",
+        (nickname, request_id),
+    )
+    updated = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify(serialize_request(updated))
+
+
+@app.route("/api/friend-request/<int:request_id>", methods=["DELETE"])
+def remove_friend_request(request_id):
+    """
+    Removes a friend relationship — deletes the request row entirely (not
+    just marking it denied), so the friend disappears from the requester's
+    list. Only the requester can do this for their own relationship; it
+    does not affect the other direction (B can still have A as a friend
+    even after A removes B, matching how the original local-only friend
+    lists behaved — removal was always one-directional).
+    Body: {"requester_id": "..."}
+    """
+    data = request.get_json(force=True) or {}
+    requester_id = (data.get("requester_id") or "").strip()
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM friend_requests WHERE id = %s", (request_id,))
+    row = cur.fetchone()
+
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "request not found"}), 404
+    if row["requester_id"] != requester_id:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "only the requester can remove their own friend relationship"}), 403
+
+    cur.execute("DELETE FROM friend_requests WHERE id = %s", (request_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({"id": request_id, "deleted": True})
 
 
 @app.route("/api/friend-request/<int:request_id>/respond", methods=["POST"])
