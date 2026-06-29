@@ -729,8 +729,11 @@ def list_incoming_requests(target_id):
 
 @app.route("/api/friend-requests/outgoing/<requester_id>", methods=["GET"])
 def list_outgoing_requests(requester_id):
-    """Lists requests this person has sent, with their current status — lets
-    the requester's device know when a pending request becomes approved."""
+    """Lists requests this person has sent, with their current status and
+    the target's name resolved — lets the requester's device know when a
+    pending request becomes approved, and show who each request was sent
+    to (not a new privacy concern, since the requester already supplied
+    that person's ID themselves to create the request)."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
@@ -738,9 +741,24 @@ def list_outgoing_requests(requester_id):
         (requester_id,),
     )
     rows = cur.fetchall()
+
+    target_ids = [r["target_id"] for r in rows]
+    name_lookup = {}
+    if target_ids:
+        placeholders = ",".join("%s" for _ in target_ids)
+        cur.execute(f"SELECT id, name FROM profiles WHERE id IN ({placeholders})", target_ids)
+        name_lookup = {r["id"]: r["name"] for r in cur.fetchall()}
+
     cur.close()
     conn.close()
-    return jsonify({"requests": [serialize_request(r) for r in rows]})
+
+    results = []
+    for row in rows:
+        r = serialize_request(row)
+        r["target_name"] = name_lookup.get(row["target_id"], "(deleted profile)")
+        results.append(r)
+
+    return jsonify({"requests": results})
 
 
 @app.route("/api/friend-request/<int:request_id>/nickname", methods=["PATCH"])
